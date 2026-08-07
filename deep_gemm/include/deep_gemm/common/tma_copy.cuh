@@ -8,9 +8,22 @@
 
 namespace deep_gemm::tma {
 
+template <typename dtype_t>
+constexpr uint32_t get_smem_pack_factor() {
+    // `float_e2m1_t` selects TMA's packed-SMEM FP4 mode: two logical
+    // elements share one physical byte.  The unpack-SMEM selector is a
+    // different CUTLASS type and intentionally keeps a factor of one.
+    if constexpr (cute::is_same_v<dtype_t, cutlass::float_e2m1_t>) {
+        return 2;
+    } else {
+        return 1;
+    }
+}
+
 template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, typename dtype_t>
 constexpr uint32_t get_inner_block_atom_size() {
-    return kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode / sizeof(dtype_t);
+    return kSwizzleMode == 0 ?
+        BLOCK_INNER : kSwizzleMode * get_smem_pack_factor<dtype_t>() / sizeof(dtype_t);
 }
 
 template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
@@ -23,6 +36,9 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
     DG_STATIC_ASSERT(static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL) ==
                      static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL), "Invalid cache hint");
     constexpr uint32_t BLOCK_INNER_ATOM = get_inner_block_atom_size<BLOCK_INNER, kSwizzleMode, dtype_t>();
+    constexpr uint32_t kPackFactor = get_smem_pack_factor<dtype_t>();
+    DG_STATIC_ASSERT(BLOCK_INNER % BLOCK_INNER_ATOM == 0, "Invalid inner block atom");
+    DG_STATIC_ASSERT(BLOCK_INNER_ATOM % kPackFactor == 0, "Invalid packed inner block atom");
 
     if constexpr (not kIs3DTMA) {
         if (num_tma_multicast == 1) {
@@ -30,7 +46,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
             for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                 cute::SM90_TMA_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                              static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                             smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                             smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                              inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
             }
         } else {
@@ -40,7 +56,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                 for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                     cute::SM100_TMA_2SM_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                                       static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                                      smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                      smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                                       inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
                 }
             #elif (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
@@ -49,7 +65,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                     for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                         cute::SM90_TMA_LOAD_MULTICAST_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                                                (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
-                                                               smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                               smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                                                inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
                     }
                 }
@@ -61,7 +77,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
             for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                 cute::SM90_TMA_LOAD_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                             static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                            smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                            smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                             inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
             }
         } else {
@@ -71,7 +87,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                 for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                     cute::SM100_TMA_2SM_LOAD_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                                       static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
-                                                      smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                      smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                                       inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
                 }
             #elif (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900))
@@ -80,7 +96,7 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
                     for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
                         cute::SM90_TMA_LOAD_MULTICAST_3D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
                                                                (1 << num_tma_multicast) - 1, static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
-                                                               smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM,
+                                                               smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM / kPackFactor,
                                                                inner_idx + i * BLOCK_INNER_ATOM, outer_idx, batch_idx);
                     }
                 }

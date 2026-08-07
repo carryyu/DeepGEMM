@@ -85,12 +85,6 @@ constexpr uint32_t get_umma_desc_stride_k() {
     return kMajorMode == cute::UMMA::Major::K ? 1 : tma::get_inner_block_atom_size<BLOCK_MN, kSwizzleMode, dtype_t>();
 }
 
-template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
-CUTLASS_DEVICE
-uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, const uint32_t& k_idx) {
-    return base + (((offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>()) * static_cast<uint32_t>(sizeof(dtype_t))) >> 4u);
-}
-
 template <typename dtype_t>
 CUTLASS_DEVICE
 constexpr uint32_t get_umma_desc_pack_factor() {
@@ -100,6 +94,15 @@ constexpr uint32_t get_umma_desc_pack_factor() {
     } else {
         return 1;
     }
+}
+
+template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t kSwizzleMode, typename dtype_t>
+CUTLASS_DEVICE
+uint32_t advance_umma_desc_lo(const uint32_t& base, const uint32_t& offset, const uint32_t& k_idx) {
+    constexpr uint32_t kPackFactor = get_umma_desc_pack_factor<dtype_t>();
+    const auto logical_elem_offset =
+        offset + k_idx * get_umma_desc_stride_k<kMajorMode, BLOCK_MN, kSwizzleMode, dtype_t>();
+    return base + ((logical_elem_offset * static_cast<uint32_t>(sizeof(dtype_t)) / kPackFactor) >> 4u);
 }
 
 template <cute::UMMA::Major kMajorMode, uint32_t BLOCK_MN, uint32_t BLOCK_K, uint32_t kSwizzleMode,

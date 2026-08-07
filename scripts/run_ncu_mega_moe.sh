@@ -5,6 +5,7 @@ set -e
 # parse num-processes, output_dir and separate python args
 num_processes=8
 output_dir=work
+mma_type=fp8xfp4
 python_args=()
 for ((arg_idx = 1; arg_idx <= $#; ++arg_idx)); do
     arg="${!arg_idx}"
@@ -16,6 +17,18 @@ for ((arg_idx = 1; arg_idx <= $#; ++arg_idx)); do
                 num_processes="${!arg_idx}"
                 python_args+=("$num_processes")
             fi
+            ;;
+        --mma-type)
+            python_args+=("$arg")
+            if ((arg_idx < $#)); then
+                ((arg_idx++))
+                mma_type="${!arg_idx}"
+                python_args+=("$mma_type")
+            fi
+            ;;
+        --mma-type=*)
+            mma_type="${arg#*=}"
+            python_args+=("$arg")
             ;;
         -h|--help)
             echo "Usage: $0 [--num-processes N] [--output DIR] [python args...]"
@@ -40,6 +53,13 @@ for ((arg_idx = 1; arg_idx <= $#; ++arg_idx)); do
     esac
 done
 
+case "$mma_type" in
+    fp8xfp4) kernel_name=sm100_fp8_fp4_mega_moe_impl ;;
+    nvfp4xnvfp4) kernel_name=sm100_nvfp4_nvfp4_mega_moe_impl ;;
+    bf16xbf16) kernel_name=sm100_bf16_mega_moe_impl ;;
+    *) echo "Unsupported MMA type: $mma_type" >&2; exit 1 ;;
+esac
+
 echo "Python Args: ${python_args[*]}"
 echo "Num Processes: $num_processes"
 echo "Output Dir: $output_dir"
@@ -55,7 +75,7 @@ sleep 2
 ncu_args=(
     --config-file off
     --force-overwrite
-    --kernel-name sm100_fp8_fp4_mega_moe_impl
+    --kernel-name "$kernel_name"
     --import-source yes
     --replay-mode application
     --section PmSampling

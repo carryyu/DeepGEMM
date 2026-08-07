@@ -5,16 +5,23 @@
 namespace deep_gemm {
 
 enum class MmaKind {
-    BF16        = 0,
-    MXFP8FP4    = 1,
+    BF16          = 0,
+    MXFP8FP4      = 1,
+    NVFP4NVFP4    = 2,
 };
 
-constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
+constexpr CUTLASS_HOST_DEVICE int get_element_bits(const MmaKind& mma_kind) {
     switch (mma_kind) {
-        case MmaKind::BF16:     return 2;
-        case MmaKind::MXFP8FP4: return 1;
+        case MmaKind::BF16:       return 16;
+        case MmaKind::MXFP8FP4:   return 8;
+        case MmaKind::NVFP4NVFP4: return 4;
         default: return 0;
     }
+}
+
+constexpr CUTLASS_HOST_DEVICE int get_element_size(const MmaKind& mma_kind) {
+    const auto num_bits = get_element_bits(mma_kind);
+    return (num_bits + 7) / 8;
 }
 
 enum class GemmType {

@@ -7,7 +7,13 @@ import torch.distributed as dist
 from typing import Optional, Tuple
 
 import deep_gemm
-from deep_gemm.utils import align, per_token_cast_to_fp4, per_token_cast_to_fp8
+from deep_gemm.utils import (
+    align,
+    cast_back_from_nvfp4,
+    per_token_cast_to_fp4,
+    per_token_cast_to_fp8,
+    per_token_cast_to_nvfp4,
+)
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import bench_kineto, calc_diff
 
@@ -59,6 +65,43 @@ def _cast_fp8_for_mega_moe(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor,
     return x_fp8, x_sf, x_sf_tma
 
 
+def _to_mn_major_tma_aligned_sf(sf: torch.Tensor) -> torch.Tensor:
+    """Copy packed int32 SF to an MN-major, 16-byte TMA-aligned tensor."""
+    assert sf.dtype == torch.int32 and sf.dim() in (2, 3)
+    squeeze_group_dim = sf.dim() == 2
+    if squeeze_group_dim:
+        sf = sf.unsqueeze(0)
+    num_groups, mn, packed_sf_k = sf.shape
+    aligned_mn = align(mn, 4)
+    result = torch.empty_strided(
+        (num_groups, mn, packed_sf_k),
+        (aligned_mn * packed_sf_k, 1, aligned_mn),
+        dtype=sf.dtype, device=sf.device)
+    result.copy_(sf)
+    return result.squeeze(0) if squeeze_group_dim else result
+
+
+def _cast_nvfp4_weights(
+    bf16_weights: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize 2D/3D K-major weights without using the UE8M0 layout API."""
+    assert bf16_weights.dim() in (2, 3)
+    squeeze_group_dim = bf16_weights.dim() == 2
+    weights = bf16_weights.unsqueeze(0) if squeeze_group_dim else bf16_weights
+    num_groups, n, k = weights.shape
+    assert k % 64 == 0
+    data = torch.empty((num_groups, n, k // 2), device=weights.device, dtype=torch.int8)
+    sf = torch.empty((num_groups, n, k // 64), device=weights.device, dtype=torch.int32)
+    global_sf = torch.empty((num_groups, n), device=weights.device, dtype=torch.float32)
+    for group_idx in range(num_groups):
+        data[group_idx], sf[group_idx], global_sf[group_idx] = (
+            per_token_cast_to_nvfp4(weights[group_idx]))
+    sf = _to_mn_major_tma_aligned_sf(sf)
+    if squeeze_group_dim:
+        return data.squeeze(0), sf.squeeze(0), global_sf.squeeze(0)
+    return data, sf, global_sf
+
+
 def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
     if num_tokens == 0:
         return
@@ -79,15 +122,26 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Settings
     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
+    is_nvfp4xnvfp4 = args.mma_type == 'nvfp4xnvfp4'
+    assert args.mma_type in ('bf16xbf16', 'fp8xfp4', 'nvfp4xnvfp4')
     num_max_tokens_per_rank = args.num_max_tokens_per_rank
     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
         if args.num_tokens == 0 else args.num_tokens
     num_shared_experts = args.num_shared_experts
     num_experts, num_topk = args.num_experts, args.num_topk
+    assert num_experts % num_ranks == 0
     num_experts_per_rank = num_experts // num_ranks
     hidden, intermediate_hidden = args.hidden, args.intermediate_hidden
     shared_intermediate_hidden = intermediate_hidden * num_shared_experts
     assert num_tokens <= num_max_tokens_per_rank
+
+    # Use a global token offset so every rank constructs a disjoint part of one
+    # deterministic, balanced routing sequence, including uneven-token tests.
+    local_num_tokens = torch.tensor([num_tokens], dtype=torch.int64, device='cuda')
+    num_tokens_per_rank = [torch.zeros_like(local_num_tokens) for _ in range(num_ranks)]
+    dist.all_gather(num_tokens_per_rank, local_num_tokens, group=group)
+    num_tokens_per_rank = [int(count.item()) for count in num_tokens_per_rank]
+    global_token_offset = sum(num_tokens_per_rank[:rank_idx])
 
     # Allocate symmetric memory
     buffer = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -98,8 +152,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         mma_type=args.mma_type
     )
 
-    # Cast weights into FP4
-    def _cast_weights_to_fp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Cast routed W4A8 weights into packed FP4 + packed UE8M0.
+    def _cast_weights_to_mxfp4(bf16_weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         num_groups, n, k = bf16_weights.shape
         w = torch.empty((num_groups, n, k // 2), device='cuda', dtype=torch.int8)
         w_sf = torch.empty((num_groups, n, k // 32), device='cuda', dtype=torch.float)
@@ -116,13 +170,29 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         global shared_l1_weights, shared_l2_weights, transformed_shared_l1_weights, transformed_shared_l2_weights
         global cumulative_local_expert_recv_stats_fused, cumulative_local_expert_recv_stats_baseline
         global initial_cumulative_local_expert_recv_stats_fused, initial_cumulative_local_expert_recv_stats_baseline
+        shared_x = shared_l1_x_sf = None
         x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
         l1_weights = torch.randn(
             (num_experts_per_rank, intermediate_hidden * 2, hidden), dtype=torch.bfloat16, device='cuda')
         l2_weights = torch.randn(
             (num_experts_per_rank, hidden, intermediate_hidden), dtype=torch.bfloat16, device='cuda')
         scores = torch.randn((num_tokens, num_experts), dtype=torch.float, device='cuda')
-        topk_weights, topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)
+        topk_weights = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False).values
+
+        # Interleave destination ranks first, then local experts. Every complete
+        # cycle visits each global expert once; an incomplete cycle differs by
+        # at most one route per expert and distributes the remainder across ranks.
+        global_route_ids = (
+            torch.arange(num_tokens * num_topk, dtype=torch.int64, device='cuda')
+            + global_token_offset * num_topk
+        )
+        dst_rank = global_route_ids.remainder(num_ranks)
+        local_expert = torch.div(
+            global_route_ids, num_ranks, rounding_mode='floor'
+        ).remainder(num_experts_per_rank)
+        topk_idx = (
+            dst_rank * num_experts_per_rank + local_expert
+        ).view(num_tokens, num_topk)
         cumulative_local_expert_recv_stats_fused = torch.randint(
             0, 100, (num_experts_per_rank, ), dtype=torch.int, device='cuda')
         cumulative_local_expert_recv_stats_baseline = cumulative_local_expert_recv_stats_fused.clone()
@@ -141,8 +211,57 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         else:
             shared_l1_weights = shared_l2_weights = None
 
-        if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
+        if is_nvfp4xnvfp4:
+            # NVFP4 uses packed E2M1 activations/weights and packed positive
+            # UE4M3 scales, one scale per 16 logical values.
+            assert hidden % 256 == 0 and intermediate_hidden % 256 == 0
+            assert shared_intermediate_hidden % 256 == 0
+            # Exercise scales far from one with token/channel log-uniform
+            # magnitudes.
+            log_scale_span = float(
+                os.getenv('DG_TEST_NVFP4_LOG_SCALE_SPAN', '8'))
+            x_scale = torch.pow(
+                2.0, torch.empty((num_tokens, 1), device='cuda').uniform_(
+                    -log_scale_span, log_scale_span))
+            x = (x.float() * x_scale).to(torch.bfloat16)
+            l1_scale = torch.pow(
+                2.0, torch.empty(
+                    (num_experts_per_rank, intermediate_hidden * 2, 1),
+                    device='cuda').uniform_(-log_scale_span, log_scale_span))
+            l2_scale = torch.pow(
+                2.0, torch.empty(
+                    (num_experts_per_rank, hidden, 1),
+                    device='cuda').uniform_(-log_scale_span, log_scale_span))
+            l1_weights = (l1_weights.float() * l1_scale).to(torch.bfloat16)
+            l2_weights = (l2_weights.float() * l2_scale).to(torch.bfloat16)
+            if num_shared_experts > 0:
+                shared_l1_scale = torch.pow(
+                    2.0, torch.empty(
+                        (shared_intermediate_hidden * 2, 1),
+                        device='cuda').uniform_(-log_scale_span, log_scale_span))
+                shared_l2_scale = torch.pow(
+                    2.0, torch.empty((hidden, 1), device='cuda').uniform_(
+                        -log_scale_span, log_scale_span))
+                shared_l1_weights = (
+                    shared_l1_weights.float() * shared_l1_scale).to(torch.bfloat16)
+                shared_l2_weights = (
+                    shared_l2_weights.float() * shared_l2_scale).to(torch.bfloat16)
+
+            x_data, x_sf, x_global_sf = per_token_cast_to_nvfp4(x)
+            x = (x_data, x_sf, x_global_sf)
+            if num_shared_experts > 0:
+                block_m = deep_gemm.get_block_m_for_mega_moe(
+                    num_ranks, num_experts, buffer.num_max_tokens_per_rank,
+                    num_tokens, num_topk, args.mma_type)
+                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(
+                    x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
+            l1_weights = _cast_nvfp4_weights(l1_weights)
+            l2_weights = _cast_nvfp4_weights(l2_weights)
+            if num_shared_experts > 0:
+                shared_l1_weights = _cast_nvfp4_weights(shared_l1_weights)
+                shared_l2_weights = _cast_nvfp4_weights(shared_l2_weights)
+        elif not is_bf16xbf16:
+            # W4A8 path: FP8 activations and FP4 routed weights with UE8M0 SF.
             assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
             block_m = deep_gemm.get_block_m_for_mega_moe(
                 num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
@@ -151,8 +270,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_x = (x_fp8, x_sf_tma)
             if num_shared_experts > 0:
                 shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
-            l1_weights = _cast_weights_to_fp4(l1_weights)
-            l2_weights = _cast_weights_to_fp4(l2_weights)
+            l1_weights = _cast_weights_to_mxfp4(l1_weights)
+            l2_weights = _cast_weights_to_mxfp4(l2_weights)
             if num_shared_experts > 0:
                 shared_l1_weights = _cast_fp8_for_mega_moe(shared_l1_weights)[0::2]
                 shared_l2_weights = _cast_fp8_for_mega_moe(shared_l2_weights)[0::2]
@@ -173,6 +292,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         else:
             buffer.x[:num_tokens].copy_(x[0])
             buffer.x_sf[:num_tokens].copy_(x[1])
+            if is_nvfp4xnvfp4:
+                buffer.x_global_sf[:num_tokens].copy_(x[2])
             if num_shared_experts > 0:
                 _copy_fp8_sf(buffer.shared_l1_acts_sf, shared_l1_x_sf, num_tokens)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
@@ -194,14 +315,155 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 shared_l1_weights=transformed_shared_l1_weights,
                 shared_l2_weights=transformed_shared_l2_weights
             )
-        (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+        kernel = deep_gemm.bf16_mega_moe if is_bf16xbf16 else (
+            deep_gemm.nvfp4_nvfp4_mega_moe
+            if is_nvfp4xnvfp4 else deep_gemm.fp8_fp4_mega_moe)
+        kernel(**kernel_kwargs)
         return y, cumulative_local_expert_recv_stats_fused
+
+    def run_nvfp4_reference():
+        """Slow decomposed reference using exactly the quantized NVFP4 operands."""
+        assert is_nvfp4xnvfp4
+
+        # Every expert rank needs all quantized tokens and routing metadata.
+        gathered_x = uneven_all_gather(x[0], group=group)
+        gathered_x_sf = uneven_all_gather(x[1], group=group)
+        gathered_x_global_sf = uneven_all_gather(x[2], group=group)
+        gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+        gathered_topk_weights = uneven_all_gather(topk_weights, group=group)
+        # FP4 * E4M3 block-scaled values are exactly representable in BF16.
+        # Keep the FP32 token global scale separate because the kernel applies
+        # activation_global * weight_global after the MMA accumulator.
+        gathered_x_base = cast_back_from_nvfp4(
+            gathered_x, gathered_x_sf,
+            torch.ones_like(gathered_x_global_sf)).to(torch.bfloat16)
+
+        local_count = torch.tensor([num_tokens], dtype=torch.int64, device='cuda')
+        gathered_counts = [torch.zeros_like(local_count) for _ in range(num_ranks)]
+        dist.all_gather(gathered_counts, local_count, group=group)
+        token_counts = [int(count.item()) for count in gathered_counts]
+        local_token_start = sum(token_counts[:rank_idx])
+        total_tokens = sum(token_counts)
+        assert gathered_x_base.size(0) == total_tokens
+
+        def nvfp4_reference_mm(
+            lhs_base: torch.Tensor,
+            lhs_global_sf: torch.Tensor,
+            rhs_data: torch.Tensor,
+            rhs_sf: torch.Tensor,
+            rhs_global_sf: torch.Tensor,
+        ) -> torch.Tensor:
+            """Match the kernel's FP32 accumulation and post-MMA globals.
+
+            Using BF16 inputs with an FP32 output selects the BF16 GEMM path
+            while retaining FP32 accumulation. This avoids relying on CUDA
+            SGEMM, which is unavailable in some SM100 PyTorch/CUDA builds.
+            """
+            rhs_base = cast_back_from_nvfp4(
+                rhs_data, rhs_sf.contiguous(),
+                torch.ones_like(rhs_global_sf)).to(torch.bfloat16)
+            output = torch.mm(
+                lhs_base, rhs_base.t(), out_dtype=torch.float32)
+            output *= lhs_global_sf.float().unsqueeze(1)
+            output *= rhs_global_sf.float().unsqueeze(0)
+            return output
+
+        def swiglu_staging(l1_output: torch.Tensor,
+                          route_weights: Optional[torch.Tensor]) -> torch.Tensor:
+            # The kernel rounds accumulators to BF16 before clamp/SwiGLU.
+            gate_bf16, up_bf16 = l1_output.to(torch.bfloat16).chunk(2, dim=-1)
+            if args.activation_clamp is not None:
+                clamp = float(args.activation_clamp)
+                gate_bf16 = torch.minimum(
+                    gate_bf16, torch.tensor(clamp, dtype=torch.bfloat16, device='cuda'))
+                up_bf16 = up_bf16.clamp(min=-clamp, max=clamp)
+            gate = gate_bf16.float()
+            activation = (gate * torch.sigmoid(gate)) * up_bf16.float()
+            if route_weights is not None:
+                activation *= route_weights.float().unsqueeze(1)
+            return activation.to(torch.bfloat16)
+
+        def swiglu_requantize(l1_output: torch.Tensor,
+                              route_weights: Optional[torch.Tensor]):
+            activation_bf16 = swiglu_staging(l1_output, route_weights)
+            return per_token_cast_to_nvfp4(activation_bf16)
+
+        # Keep one BF16 contribution per Top-K slot.
+        routed_slots = torch.zeros(
+            (total_tokens, num_topk, hidden),
+            dtype=torch.bfloat16, device='cuda')
+        local_expert_begin = rank_idx * num_experts_per_rank
+        local_expert_end = local_expert_begin + num_experts_per_rank
+        local_route_mask = (
+            (gathered_topk_idx >= local_expert_begin) &
+            (gathered_topk_idx < local_expert_end)
+        )
+        local_route_ids = gathered_topk_idx[local_route_mask] - local_expert_begin
+        stats_delta = torch.bincount(
+            local_route_ids, minlength=num_experts_per_rank).to(torch.int32)
+        expected_stats = initial_cumulative_local_expert_recv_stats_fused + stats_delta
+
+        for local_expert_idx in range(num_experts_per_rank):
+            global_expert_idx = local_expert_begin + local_expert_idx
+            token_ids, topk_slots = (gathered_topk_idx == global_expert_idx).nonzero(
+                as_tuple=True)
+            if token_ids.numel() == 0:
+                continue
+
+            l1_output = nvfp4_reference_mm(
+                gathered_x_base[token_ids],
+                gathered_x_global_sf[token_ids],
+                l1_weights[0][local_expert_idx],
+                l1_weights[1][local_expert_idx],
+                l1_weights[2][local_expert_idx])
+            l2_data, l2_sf, l2_global_sf = swiglu_requantize(
+                l1_output, gathered_topk_weights[token_ids, topk_slots])
+            l2_input_base = cast_back_from_nvfp4(
+                l2_data, l2_sf, torch.ones_like(l2_global_sf)).to(torch.bfloat16)
+            contribution = nvfp4_reference_mm(
+                l2_input_base, l2_global_sf,
+                l2_weights[0][local_expert_idx],
+                l2_weights[1][local_expert_idx],
+                l2_weights[2][local_expert_idx])
+            contribution = contribution.to(torch.bfloat16)
+            routed_slots[token_ids, topk_slots] = contribution
+            del l1_output, l2_data, l2_sf, l2_global_sf, l2_input_base, contribution
+
+        # Exactly one rank owns each routed expert, so the all-reduce only
+        # transports the selected BF16 combine slots.
+        dist.all_reduce(routed_slots, group=group)
+        routed_output = routed_slots.float().sum(dim=1)
+        local_output = routed_output[
+            local_token_start:local_token_start + num_tokens]
+
+        if num_shared_experts > 0:
+            local_x_base = cast_back_from_nvfp4(
+                x[0], x[1], torch.ones_like(x[2])).to(torch.bfloat16)
+            shared_l1_output = nvfp4_reference_mm(
+                local_x_base, x[2],
+                shared_l1_weights[0], shared_l1_weights[1],
+                shared_l1_weights[2])
+            shared_l2_data, shared_l2_sf, shared_l2_global_sf = (
+                swiglu_requantize(shared_l1_output, None))
+            shared_l2_base = cast_back_from_nvfp4(
+                shared_l2_data, shared_l2_sf,
+                torch.ones_like(shared_l2_global_sf)).to(torch.bfloat16)
+            shared_output = nvfp4_reference_mm(
+                shared_l2_base, shared_l2_global_sf,
+                shared_l2_weights[0], shared_l2_weights[1],
+                shared_l2_weights[2])
+            shared_output = shared_output.to(torch.bfloat16)
+            local_output = local_output + shared_output.float()
+
+        return local_output.to(torch.bfloat16), expected_stats
 
     dist_print('Config:', once_in_node=True)
     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
     dist_print(f' > Hidden: {hidden}', once_in_node=True)
     dist_print(f' > Intermediate: {intermediate_hidden}', once_in_node=True)
+    if is_nvfp4xnvfp4:
+        dist_print(' > Combine: BF16', once_in_node=True)
     dist_print(f' > Shared experts: {num_shared_experts}', once_in_node=True)
     dist_print(f' > Experts: {num_topk}/{num_experts}', once_in_node=True)
     dist_print(f' > Buffer: {buffer.buffer.nbytes / 2 ** 30:.3f} GiB', once_in_node=True)
@@ -222,6 +484,10 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+    can_run_legacy_baseline = is_legacy_loaded and not is_nvfp4xnvfp4
+    if is_legacy_loaded and is_nvfp4xnvfp4:
+        dist_print('Legacy baseline does not implement NVFP4 global scaling; using the PyTorch reference only.',
+                   once_in_node=True)
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
     deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
     num_correctness_tests = 1 if args.num_correctness_tests is None else args.num_correctness_tests
@@ -232,11 +498,11 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         explicitly_destroy=True,
         allow_multiple_reduction=False,
         num_gpu_timeout_secs=10, num_cpu_timeout_secs=30
-    ) if is_legacy_loaded else None
+    ) if can_run_legacy_baseline else None
 
     # Baseline params differ by mma type
     run_baseline = None
-    if is_legacy_loaded:
+    if can_run_legacy_baseline:
         if is_bf16xbf16:
             dispatch_kwargs = {'do_cpu_sync': False, 'do_handle_copy': False, 'do_expand': True}
             gemm_fn = deep_gemm.m_grouped_bf16_gemm_nt_contiguous
@@ -313,7 +579,28 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Check correctness
     # noinspection PyBroadException
-    if is_legacy_loaded and num_correctness_tests > 0:
+    if is_nvfp4xnvfp4 and num_correctness_tests > 0:
+        dist_print('Running NVFP4 PyTorch-reference correctness tests:', once_in_node=True)
+        for i in range(num_correctness_tests):
+            create_inputs()
+            fused_y, fused_stats = run_fused()
+            reference_y, reference_stats = run_nvfp4_reference()
+            assert torch.equal(fused_stats, reference_stats), (
+                f'rank {rank_idx}: stats mismatch: fused={fused_stats}, '
+                f'reference={reference_stats}')
+            diff = calc_diff(fused_y, reference_y)
+            if not isinstance(diff, torch.Tensor):
+                diff = torch.tensor(diff, device='cuda')
+            dist.all_reduce(diff, op=dist.ReduceOp.MAX, group=group)
+            max_diff = float(diff.item())
+            assert max_diff < 0.02, f'NVFP4 correctness diff {max_diff} >= 0.02'
+            if (i + 1) % 100 == 0 or i == num_correctness_tests - 1:
+                dist_print(
+                    f' > Correctness test #{i + 1}/{num_correctness_tests} passed, '
+                    f'max calc_diff={max_diff:.6f}',
+                    once_in_node=True)
+        dist_print(once_in_node=True)
+    elif can_run_legacy_baseline and num_correctness_tests > 0:
         dist_print('Running correctness tests:', once_in_node=True)
         for i in range(num_correctness_tests):
             create_inputs()
@@ -332,6 +619,13 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # Count local received tokens
     gathered_topk_idx = uneven_all_gather(topk_idx, group=group)
+    if args.masked_ratio == 0:
+        expert_recv_counts = torch.bincount(
+            gathered_topk_idx.flatten(), minlength=num_experts)
+        assert int(expert_recv_counts.max() - expert_recv_counts.min()) <= 1
+        rank_recv_counts = expert_recv_counts.view(
+            num_ranks, num_experts_per_rank).sum(dim=1)
+        assert int(rank_recv_counts.max() - rank_recv_counts.min()) <= 1
     gathered_topk_idx[(gathered_topk_idx < rank_idx * num_experts_per_rank) | \
                       (gathered_topk_idx >= (rank_idx + 1) * num_experts_per_rank)] = -1
     num_recv_tokens = (gathered_topk_idx != -1).sum().item()
@@ -342,8 +636,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     t_fused = bench_kineto(run_fused, 'mega_moe', barrier=barrier_fn, trace_path=trace_path)
     t_baseline = tilelang_bench(
         run_baseline, _n_warmup=5, _n_repeat=1,
-        backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
-
+        backend='cudagraph', return_mode='median') / 1e3 if can_run_legacy_baseline else 0
     # TFLOPS: routed + shared L1/L2, each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
     num_routed_flops = 2 * num_recv_tokens * hidden * intermediate_hidden * 3
@@ -352,30 +645,61 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     # HBM bytes: weights + activations + output
     num_touched_experts = torch.unique(gathered_topk_idx[gathered_topk_idx >= 0]).numel()
-    act_elem_size, weight_elem_size = (2, 2) if is_bf16xbf16 else (1, 0.5)
+    if is_bf16xbf16:
+        act_data_bytes, weight_data_bytes, sf_bytes_per_elem = 2.0, 2.0, 0.0
+    elif is_nvfp4xnvfp4:
+        act_data_bytes, weight_data_bytes, sf_bytes_per_elem = 0.5, 0.5, 1.0 / 16
+    else:
+        act_data_bytes, weight_data_bytes, sf_bytes_per_elem = 1.0, 0.5, 1.0 / 32
+    act_storage_bytes = act_data_bytes + sf_bytes_per_elem
+    weight_storage_bytes = weight_data_bytes + sf_bytes_per_elem
+    combine_storage_bytes = 2.0
     num_routed_hbm_bytes = (
-        num_touched_experts * intermediate_hidden * 2 * hidden * weight_elem_size      # L1 weights
-        + num_touched_experts * hidden * intermediate_hidden * weight_elem_size        # L2 weights
-        + num_recv_tokens * hidden * act_elem_size                                     # L1 acts read
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L1 output write
-        + num_recv_tokens * intermediate_hidden * act_elem_size                        # L2 acts read
-        + num_recv_tokens * hidden * 2                                                 # L2 output write (always BF16)
+        num_touched_experts * intermediate_hidden * 2 * hidden * weight_storage_bytes  # L1 weights + SF
+        + num_touched_experts * hidden * intermediate_hidden * weight_storage_bytes    # L2 weights + SF
+        + num_recv_tokens * hidden * act_storage_bytes                                 # L1 acts + SF read
+        + num_recv_tokens * intermediate_hidden * act_storage_bytes                    # L1 output + SF write
+        + num_recv_tokens * intermediate_hidden * act_storage_bytes                    # L2 acts + SF read
+        + num_recv_tokens * hidden * combine_storage_bytes                             # L2 combine write
     )
     num_shared_hbm_bytes = 0 if num_shared_experts == 0 else (
-        shared_intermediate_hidden * 2 * hidden * weight_elem_size      # Shared L1 weights
-        + hidden * shared_intermediate_hidden * weight_elem_size        # Shared L2 weights
-        + num_tokens * hidden * act_elem_size                           # Shared L1 acts read
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L1 output write
-        + num_tokens * shared_intermediate_hidden * act_elem_size       # Shared L2 acts read
-        + num_tokens * hidden * 2                                       # Shared L2 output write
+        shared_intermediate_hidden * 2 * hidden * weight_storage_bytes  # Shared L1 weights + SF
+        + hidden * shared_intermediate_hidden * weight_storage_bytes    # Shared L2 weights + SF
+        + num_tokens * hidden * act_storage_bytes                       # Shared L1 acts + SF read
+        + num_tokens * shared_intermediate_hidden * act_storage_bytes   # Shared L1 output + SF write
+        + num_tokens * shared_intermediate_hidden * act_storage_bytes   # Shared L2 acts + SF read
+        + num_tokens * hidden * combine_storage_bytes                   # Shared L2 combine write
     )
+    # if is_nvfp4xnvfp4:
+    #     # Additional hierarchical-NVFP4 traffic not represented by
+    #     # `act_storage_bytes`: BF16 stage write/read (4 B/element), FP32 K16
+    #     # amax write and two reads (0.75 B/element), activation globals, and
+    #     # per-output-channel weight globals.
+    #     num_routed_hbm_bytes += (
+    #         num_recv_tokens * intermediate_hidden * 4.75
+    #         + num_recv_tokens * 12
+    #         + num_touched_experts * (intermediate_hidden * 2 + hidden) * 4
+    #     )
+    #     if num_shared_experts > 0:
+    #         num_shared_hbm_bytes += (
+    #             num_tokens * shared_intermediate_hidden * 4.75
+    #             + num_tokens * 12
+    #             + (shared_intermediate_hidden * 2 + hidden) * 4
+    #         )
     num_hbm_bytes = num_routed_hbm_bytes + num_shared_hbm_bytes
 
-    # NVLink bytes: dispatch pull + combine write-back
-    num_nvlink_bytes = num_recv_tokens * hidden * 3
+    # NVLink bytes: packed dispatch data + SF (+ NVFP4 token global), then
+    # BF16 combine write-back.
+    num_nvlink_bytes = (
+        num_recv_tokens * hidden * (
+            act_storage_bytes + combine_storage_bytes)
+        + (num_recv_tokens * 4 if is_nvfp4xnvfp4 else 0)
+    )
 
     # Combine reduction (serial) time approximation
-    t_reduction = num_tokens * hidden * 2 * (1 + num_topk) / 6.5e12
+    num_combine_slots = num_topk + (1 if num_shared_experts > 0 else 0)
+    t_reduction = num_tokens * hidden * (
+        2.0 + num_combine_slots * combine_storage_bytes) / 6.5e12
 
     # Summary
     def print_perf(elapsed: float, ref_time: float, ref_label: str):
@@ -399,7 +723,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # Exit
     dist.barrier()
     buffer.destroy()
-    ep_buffer.destroy() if is_legacy_loaded else None
+    ep_buffer.destroy() if can_run_legacy_baseline else None
     dist.destroy_process_group()
 
 
@@ -422,7 +746,10 @@ if __name__ == '__main__':
     parser.add_argument('--num-topk', type=int, default=6, help='Number of expert selections')
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--fast-math', type=int, default=1, help='Enable fast math (0 or 1, default: 1)')
-    parser.add_argument('--mma-type', type=str, default='fp8xfp4', help='MMA type: fp8xfp4 or bf16xbf16')
+    parser.add_argument(
+        '--mma-type', type=str, default='fp8xfp4',
+        choices=('fp8xfp4', 'nvfp4xnvfp4', 'bf16xbf16'),
+        help='MMA type')
 
     # Test settings
     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')

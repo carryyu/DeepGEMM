@@ -88,6 +88,24 @@ CUTLASS_DEVICE void tma_store_1d(
                  : "memory");
 }
 
+CUTLASS_DEVICE void tma_store_2d(
+    const void* desc_ptr, const void* smem_ptr,
+    const uint32_t& col_idx, const uint32_t& row_idx,
+    const cute::TMA::CacheHintSm90& hint =
+        cute::TMA::CacheHintSm90::EVICT_NORMAL) {
+    const auto desc_addr = reinterpret_cast<uint64_t>(desc_ptr);
+    const auto smem_addr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    // NVFP4 consumes the BF16 row again immediately after all L1 N tiles
+    // arrive. Prefer retaining these stores in L2 for that quantization pass.
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint "
+        "[%0, {%2, %3}], [%1], %4;\n" ::
+        "l"(desc_addr), "r"(smem_addr), "r"(col_idx), "r"(row_idx),
+        "l"(hint)
+        : "memory");
+}
+
 template <int kNumRemainingWaits = 0>
 __forceinline__ __device__ void tma_store_wait() {
     // NOTES: this function does not have `.read`

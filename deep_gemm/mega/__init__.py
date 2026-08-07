@@ -51,12 +51,12 @@ class SymmBuffer:
         torch.cuda.synchronize()
 
         # Create input buffer views
-        (self.x, self.x_sf,
+        (self.x, self.x_sf, self.x_global_sf,
          self.topk_idx, self.topk_weights,
          self.shared_l1_acts, self.shared_l1_acts_sf,
-         self.shared_l2_acts, self.shared_l2_acts_sf,
+         self.shared_l2_acts, self.shared_l2_acts_sf, _shared_l2_staging,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+         self.l2_acts, self.l2_acts_sf, _l2_staging) = slice_input_buffers(self.buffer)
 
     def destroy(self):
         self.handle = None
@@ -64,6 +64,7 @@ class SymmBuffer:
         self.group = None
         self.x = None
         self.x_sf = None
+        self.x_global_sf = None
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -111,6 +112,24 @@ def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     return result.squeeze(0) if squeeze_group_dim else result
 
 
+def _interleave_channel_scales(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Interleave gate/up scales whose last dimension is the output channel."""
+    assert t.dtype == torch.float32 and t.dim() in (1, 2)
+    squeeze_group_dim = t.dim() == 1
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+
+    num_groups, n = t.shape
+    assert n % (2 * gran) == 0
+    half = n // 2
+    gate = t[:, :half].reshape(num_groups, half // gran, gran)
+    up = t[:, half:].reshape(num_groups, half // gran, gran)
+    result = torch.empty_like(t).copy_(
+        torch.stack([gate, up], dim=2).reshape(num_groups, n)
+    )
+    return result.squeeze(0) if squeeze_group_dim else result
+
+
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     # Unsqueeze for 2D
     assert sf.dtype == torch.int and sf.dim() in (2, 3)
@@ -129,19 +148,47 @@ def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def transform_weights_for_mega_moe(
-    l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    l1_weights: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
+    l2_weights: Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
     activation: str = 'swiglu'
-) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-           Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
+) -> Tuple[
+    Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
+    Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ],
+]:
     assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
+        assert isinstance(l2_weights, tuple)
+        assert len(l1_weights) == len(l2_weights)
+        assert len(l1_weights) in (2, 3)
+        # Scaled paths: interleave gate/up for data and SF, then transpose
+        # packed SF for the SM100 UTCCP load.
         l1_w = _interleave_weights(l1_weights[0])
         l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
-        l1_transformed = (l1_w, l1_sf)
         # L2: only transpose SF for UTCCP
-        l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
+        l2_sf = _transpose_sf_for_utccp(l2_weights[1])
+        if len(l1_weights) == 3:
+            l1_global_sf = _interleave_channel_scales(l1_weights[2])
+            l1_transformed = (l1_w, l1_sf, l1_global_sf)
+            l2_transformed = (l2_weights[0], l2_sf, l2_weights[2].contiguous())
+        else:
+            l1_transformed = (l1_w, l1_sf)
+            l2_transformed = (l2_weights[0], l2_sf)
     else:
         # BF16: L1 interleave gate/up, L2 unchanged
         l1_transformed = _interleave_weights(l1_weights)
@@ -174,6 +221,35 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
+
+
+def nvfp4_nvfp4_mega_moe(y: torch.Tensor,
+                         l1_weights: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                         l2_weights: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                         sym_buffer: SymmBuffer,
+                         shared_l1_weights: Optional[
+                             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+                         shared_l2_weights: Optional[
+                             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+                         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                         recipe: Tuple[int, int, int] = (1, 1, 16),
+                         activation: str = 'swiglu',
+                         activation_clamp: Optional[float] = None,
+                         fast_math: bool = True):
+    _C.nvfp4_nvfp4_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,

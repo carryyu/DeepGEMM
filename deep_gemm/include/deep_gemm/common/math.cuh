@@ -4,6 +4,10 @@
 #include <deep_gemm/common/compile.cuh>
 #include <deep_gemm/common/exception.cuh>
 
+#ifdef DG_IN_CUDA_COMPILATION
+#include <cutlass/numeric_conversion.h>
+#endif
+
 namespace deep_gemm::math {
 
 /// Pointer operations
@@ -96,6 +100,35 @@ CUTLASS_DEVICE void get_e4m3_sf_and_sf_inv(const float2& amax, float2& sf, float
     const auto exp_y = fast_log2_ceil(scaled.y);
     sf.x = fast_pow2(exp_x), sf_inv.x = fast_pow2(-exp_x);
     sf.y = fast_pow2(exp_y), sf_inv.y = fast_pow2(-exp_y);
+}
+
+CUTLASS_DEVICE float get_nvfp4_global_sf(const float& row_amax) {
+    // The global scale is a dequantization multiplier. Reserving 448 in the
+    // UE4M3 block scale and 6 in E2M1 guarantees that the row maximum is
+    // representable. Keep all-zero rows well-defined.
+    constexpr float kInvHierarchicalMax = 1.0f / (448.0f * 6.0f);
+    return row_amax == 0.0f ? 1.0f : row_amax * kInvHierarchicalMax;
+}
+
+template <bool kFastMath>
+CUTLASS_DEVICE uint8_t get_nvfp4_sf_and_sf_inv(
+        const float& block_amax, const float& global_sf_inv,
+        float& sf_inv) {
+    constexpr float kInvFP4Max = 1.0f / 6.0f;
+    constexpr float kMinPositiveUE4M3 = 0x1p-9f;
+    const float unbounded = block_amax * kInvFP4Max * global_sf_inv;
+    const float candidate =
+        unbounded > kMinPositiveUE4M3 ? unbounded : kMinPositiveUE4M3;
+    using converter_t = cutlass::NumericConverter<
+        cutlass::float_ue4m3_t, float,
+        cutlass::FloatRoundStyle::round_to_nearest_satfinite>;
+    const auto quantized = converter_t::convert(candidate);
+    const float block_sf = static_cast<float>(quantized);
+    if constexpr (kFastMath)
+        sf_inv = global_sf_inv * fast_rcp(block_sf);
+    else
+        sf_inv = global_sf_inv / block_sf;
+    return quantized.raw();
 }
 
 /// Reduction

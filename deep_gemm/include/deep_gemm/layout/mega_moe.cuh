@@ -57,6 +57,7 @@ struct Workspace {
 
     // Full-pool span used by non-ring token metadata
     uint32_t num_max_pool_tokens;
+    bool with_nvfp4_global_sf;
 
     // Keep grid/NVLink/schedule counters separated from expert counters.
     // NVIDIA L2 cache lines are 128B, and these counters are hot atomics.
@@ -70,11 +71,13 @@ struct Workspace {
               const uint32_t& num_experts,
               const uint32_t& num_max_tokens_per_rank,
               const uint32_t& num_topk,
-              const uint32_t& num_ring_tokens):
+              const uint32_t& num_ring_tokens,
+              const bool& with_nvfp4_global_sf = false):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
         num_max_tokens_per_rank(num_max_tokens_per_rank),
-        num_ring_tokens(num_ring_tokens) {
+        num_ring_tokens(num_ring_tokens),
+        with_nvfp4_global_sf(with_nvfp4_global_sf) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
@@ -109,6 +112,14 @@ struct Workspace {
 
         // Shared L2 full block count
         num_bytes += num_shared_l2_pool_blocks * sizeof(uint32_t);
+
+        if (with_nvfp4_global_sf) {
+            // L1 BF16 staging completion count (ring).
+            num_bytes += num_ring_blocks * sizeof(uint32_t);
+
+            // Shared-L1 BF16 staging completion count.
+            num_bytes += num_shared_l2_pool_blocks * sizeof(uint32_t);
+        }
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
@@ -221,11 +232,27 @@ struct Workspace {
         return reinterpret_cast<uint32_t*>(base) + block_idx;
     }
 
+    CUTLASS_DEVICE
+    uint32_t* get_l1_stage_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
+        DG_DEVICE_ASSERT(with_nvfp4_global_sf);
+        const auto base = get_shared_l2_full_count_ptr(num_shared_l2_pool_blocks);
+        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_shared_l1_stage_full_count_ptr(const uint32_t& block_idx = 0) const {
+        DG_DEVICE_ASSERT(with_nvfp4_global_sf);
+        const auto base = get_l1_stage_full_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + block_idx;
+    }
+
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_shared_l2_full_count_ptr(num_shared_l2_pool_blocks);
+        const auto base = with_nvfp4_global_sf ?
+            get_shared_l1_stage_full_count_ptr(num_shared_l2_pool_blocks) :
+            get_shared_l2_full_count_ptr(num_shared_l2_pool_blocks);
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
@@ -334,20 +361,27 @@ struct MegaMoEBuffer {
     // Input buffers (per-rank)
     Buffer input_token_buffer,
            input_sf_buffer,
+           input_global_sf_buffer,
            input_topk_idx_buffer,
            input_topk_weights_buffer;
 
     // Routed expert ring buffers
     // NOTE: shared L1 tokens reuse `input_token_buffer`.
     Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
-           shared_l2_token_buffer, shared_l2_sf_buffer;
+           shared_l1_global_sf_buffer,
+           shared_l2_staging_buffer, shared_l2_amax_buffer,
+           shared_l2_token_buffer, shared_l2_sf_buffer, shared_l2_global_sf_buffer;
 
     // Routed expert ring buffers
     Buffer l1_token_buffer,
            l1_sf_buffer,
+           l1_global_sf_buffer,
            l1_topk_weights_buffer,
+           l2_staging_buffer,
+           l2_amax_buffer,
            l2_token_buffer,
            l2_sf_buffer,
+           l2_global_sf_buffer,
            combine_token_buffer;
 
     CUTLASS_HOST_DEVICE
@@ -361,78 +395,146 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0) {
+                  const uint32_t& num_shared_experts = 0,
+                  uint32_t mma_elem_bits = 0,
+                  const uint32_t& sf_gran_k = 32,
+                  const bool& with_nvfp4_global_sf = false) {
+        DG_UNIFIED_ASSERT(not with_nvfp4_global_sf or
+                          (with_sf and mma_elem_bits == 4 and sf_gran_k == 16));
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
-                              num_max_tokens_per_rank, num_topk, num_ring_tokens);
+                              num_max_tokens_per_rank, num_topk, num_ring_tokens,
+                              with_nvfp4_global_sf);
 
         // Shared
         const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // Layouts
-        const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
+        // Keep the historical inference for existing callers: BF16 uses 16
+        // bits and the scaled W4A8 path uses byte-wide activation storage.
+        if (mma_elem_bits == 0)
+            mma_elem_bits = with_sf ? 8u : 16u;
+        DG_UNIFIED_ASSERT(mma_elem_bits == 4 or mma_elem_bits == 8 or mma_elem_bits == 16);
+        DG_UNIFIED_ASSERT((hidden * mma_elem_bits) % 8 == 0);
+        DG_UNIFIED_ASSERT((intermediate_hidden * mma_elem_bits) % 8 == 0);
+        DG_UNIFIED_ASSERT((shared_intermediate_hidden * mma_elem_bits) % 8 == 0);
+        if (with_sf) {
+            DG_UNIFIED_ASSERT(sf_gran_k > 0);
+            // Four one-byte SF values are packed into each exposed int32.
+            DG_UNIFIED_ASSERT(hidden % (sf_gran_k * 4) == 0);
+            DG_UNIFIED_ASSERT(intermediate_hidden % (sf_gran_k * 4) == 0);
+            DG_UNIFIED_ASSERT(shared_intermediate_hidden % (sf_gran_k * 4) == 0);
+        }
+
+        const auto input_token_layout = layout::Data(hidden * mma_elem_bits / 8);
         const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0);
+        const auto intermediate_token_layout = layout::Data(intermediate_hidden * mma_elem_bits / 8);
+        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * mma_elem_bits / 8);
+        const auto input_sf_layout = layout::Data(with_sf ? hidden / sf_gran_k : 0);
+        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / sf_gran_k : 0);
+        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / sf_gran_k : 0);
+        const auto global_sf_layout = layout::Data(
+            with_nvfp4_global_sf ? sizeof(float) : 0, false);
+        const auto intermediate_bf16_staging_layout = layout::Data(
+            with_nvfp4_global_sf ? intermediate_hidden * sizeof(nv_bfloat16) : 0);
+        const auto shared_intermediate_bf16_staging_layout = layout::Data(
+            with_nvfp4_global_sf ? shared_intermediate_hidden * sizeof(nv_bfloat16) : 0);
+        // L1 persists one row maximum per K64 output tile. Exact K16
+        // maxima are recomputed from BF16 during full-row quantization.
+        constexpr uint32_t kNVFP4AmaxGranK = 64;
+        const auto intermediate_amax_layout = layout::Data(
+            with_nvfp4_global_sf ?
+                intermediate_hidden / kNVFP4AmaxGranK * sizeof(float) : 0);
+        const auto shared_intermediate_amax_layout = layout::Data(
+            with_nvfp4_global_sf ?
+                shared_intermediate_hidden / kNVFP4AmaxGranK * sizeof(float) : 0);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
+        // Packed FP4 tensor maps require a 32-byte global base.
+        const auto workspace_bytes = workspace.get_num_bytes();
+        const auto input_buffer_offset = mma_elem_bits == 4 ?
+            math::align<uint64_t>(workspace_bytes, 32) : workspace_bytes;
+        const auto input_buffer_base = math::advance_ptr(base, input_buffer_offset);
 
         // Input buffers
         input_token_buffer = Buffer(
             input_token_layout, 1, num_max_tokens_per_rank,
-            workspace.get_end_ptr());
+            input_buffer_base);
         input_sf_buffer = Buffer(
             input_sf_layout, 1, num_max_tokens_per_rank,
             input_token_buffer.get_end_ptr());
+        input_global_sf_buffer = Buffer(
+            global_sf_layout, 1, num_max_tokens_per_rank,
+            input_sf_buffer.get_end_ptr());
         input_topk_idx_buffer = Buffer(
             input_topk_idx_layout, 1, num_max_tokens_per_rank,
-            with_sf ? input_sf_buffer.get_end_ptr() : input_token_buffer.get_end_ptr());
+            input_global_sf_buffer.get_end_ptr());
         input_topk_weights_buffer = Buffer(
             input_topk_weights_layout, 1, num_max_tokens_per_rank,
             input_topk_idx_buffer.get_end_ptr());
 
         // Shared expert buffers
         shared_l1_token_buffer = input_token_buffer;
+        shared_l1_global_sf_buffer = input_global_sf_buffer;
         shared_l1_sf_buffer = Buffer(
             input_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
             input_topk_weights_buffer.get_end_ptr());
+        shared_l2_staging_buffer = Buffer(
+            shared_intermediate_bf16_staging_layout, 1,
+            num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+            shared_l1_sf_buffer.get_end_ptr());
+        shared_l2_amax_buffer = Buffer(
+            shared_intermediate_amax_layout, 1,
+            num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+            shared_l2_staging_buffer.get_end_ptr());
         shared_l2_token_buffer = Buffer(
             shared_intermediate_token_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
-            with_sf ? shared_l1_sf_buffer.get_end_ptr() : input_topk_weights_buffer.get_end_ptr());
+            shared_l2_amax_buffer.get_end_ptr());
         shared_l2_sf_buffer = Buffer(
             shared_intermediate_sf_layout, 1, num_shared_experts > 0 ? num_max_shared_sf_tokens : 0,
             shared_l2_token_buffer.get_end_ptr());
+        shared_l2_global_sf_buffer = Buffer(
+            global_sf_layout, 1, num_shared_experts > 0 ? num_max_tokens_per_rank : 0,
+            shared_l2_sf_buffer.get_end_ptr());
 
         // Routed expert ring buffers
         l1_token_buffer = Buffer(
             input_token_layout, 1, num_ring_tokens,
             num_shared_experts > 0 ?
-                (with_sf ? shared_l2_sf_buffer.get_end_ptr() : shared_l2_token_buffer.get_end_ptr()) :
+                shared_l2_global_sf_buffer.get_end_ptr() :
                 input_topk_weights_buffer.get_end_ptr()
         );
         l1_sf_buffer = Buffer(
             input_sf_layout, 1, num_sf_ring_tokens,
             l1_token_buffer.get_end_ptr());
+        l1_global_sf_buffer = Buffer(
+            global_sf_layout, 1, num_ring_tokens,
+            l1_sf_buffer.get_end_ptr());
         l1_topk_weights_buffer = Buffer(
             l1_topk_weights_layout, 1, num_ring_tokens,
-            with_sf ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+            l1_global_sf_buffer.get_end_ptr());
 
+        l2_staging_buffer = Buffer(
+            intermediate_bf16_staging_layout, 1, num_ring_tokens,
+            l1_topk_weights_buffer.get_end_ptr());
+        l2_amax_buffer = Buffer(
+            intermediate_amax_layout, 1, num_ring_tokens,
+            l2_staging_buffer.get_end_ptr());
         l2_token_buffer = Buffer(
             intermediate_token_layout, 1, num_ring_tokens,
-            l1_topk_weights_buffer.get_end_ptr());
+            l2_amax_buffer.get_end_ptr());
         l2_sf_buffer = Buffer(
             intermediate_sf_layout, 1, num_sf_ring_tokens,
             l2_token_buffer.get_end_ptr());
+        l2_global_sf_buffer = Buffer(
+            global_sf_layout, 1, num_ring_tokens,
+            l2_sf_buffer.get_end_ptr());
 
         combine_token_buffer = Buffer(
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
-            with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+            l2_global_sf_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE

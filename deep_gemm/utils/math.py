@@ -122,6 +122,110 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), sf
 
 
+def _quantize_to_fp4_e2m1_rn_satfinite(x: torch.Tensor) -> torch.Tensor:
+    """Quantize to E2M1 with round-to-nearest-even and finite saturation."""
+    ax = torch.nan_to_num(x.abs().float(), nan=0.0, posinf=float('inf'))
+    code = torch.zeros_like(ax, dtype=torch.uint8)
+    # At exact midpoints, choose the code whose low significand bit is even.
+    for boundary, upper_is_even in (
+        (0.25, False), (0.75, True), (1.25, False), (1.75, True),
+        (2.5, False), (3.5, True), (5.0, False),
+    ):
+        comparison = ax >= boundary if upper_is_even else ax > boundary
+        code += comparison.to(torch.uint8)
+    sign = (x < 0) & (code != 0)
+    return (code | (sign.to(torch.uint8) << 3)).view(torch.int8)
+
+
+def _pack_positive_e4m3_to_int(sf: torch.Tensor) -> torch.Tensor:
+    assert sf.dtype == torch.float8_e4m3fn and sf.size(-1) % 4 == 0
+    raw = sf.contiguous().view(torch.uint8)
+    raw4 = raw.reshape(*sf.shape[:-1], sf.size(-1) // 4, 4).to(torch.int32)
+    return (raw4[..., 0] |
+            (raw4[..., 1] << 8) |
+            (raw4[..., 2] << 16) |
+            (raw4[..., 3] << 24))
+
+
+def per_token_cast_to_nvfp4(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cast rows to hierarchical NVFP4.
+
+    Returns packed E2M1 data, packed positive UE4M3 block scales (K16), and
+    one FP32 dequantization scale per row.
+    """
+    assert x.dim() == 2
+    m, n = x.shape
+    assert n % 2 == 0
+
+    # Four one-byte UE4M3 scales are packed into each int32, so pad K to 64.
+    padded_n = align(n, 64)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, padded_n // 16, 16).float()
+
+    # NVFP4 uses hierarchical scaling:
+    #   x ~= e2m1 * block_sf_e4m3 * row_global_sf_fp32.
+    # Keep zero rows well-defined.
+    row_amax = x_view.abs().amax(dim=(1, 2))
+    global_sf = torch.where(
+        row_amax == 0,
+        torch.ones_like(row_amax),
+        row_amax / (448.0 * 6.0),
+    )
+
+    # Positive E4M3FN has the same raw encoding as UE4M3. Clamp first to
+    # implement satfinite conversion, then use the quantized scale itself.
+    sf_candidate = (
+        x_view.abs().amax(dim=2) / (6.0 * global_sf.unsqueeze(1))
+    ).clamp(min=2.0 ** -9, max=448.0)
+    sf_fp8 = sf_candidate.to(torch.float8_e4m3fn)
+    sf_quantized = sf_fp8.float()
+    x_scaled = x_view / (
+        sf_quantized.unsqueeze(2) * global_sf.unsqueeze(1).unsqueeze(2)
+    )
+
+    codes = _quantize_to_fp4_e2m1_rn_satfinite(x_scaled).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = (codes2[..., 0] & 0x0F) | ((codes2[..., 1] & 0x0F) << 4)
+    return (
+        packed[:, :n // 2].contiguous(),
+        _pack_positive_e4m3_to_int(sf_fp8),
+        global_sf.contiguous(),
+    )
+
+
+def unpack_ue4m3_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
+    """Unpack four positive UE4M3 bytes per int32 into FP32 scale values."""
+    assert packed_sf.dtype == torch.int32
+    raw = packed_sf.contiguous().view(torch.uint8)
+    return raw.view(torch.float8_e4m3fn).float()
+
+
+def cast_back_from_nvfp4(
+    packed: torch.Tensor,
+    packed_sf: torch.Tensor,
+    global_sf: torch.Tensor,
+) -> torch.Tensor:
+    """Reference dequantization for ``per_token_cast_to_nvfp4``."""
+    assert packed.dtype == torch.int8 and packed.dim() == 2
+    assert packed_sf.dtype == torch.int32 and packed_sf.dim() == 2
+    assert global_sf.dtype == torch.float32 and global_sf.dim() == 1
+    m, n2 = packed.shape
+    n = n2 * 2
+    assert packed_sf.size(0) == m and global_sf.numel() == m
+    sf = unpack_ue4m3_from_int(packed_sf)
+    assert sf.size(1) >= ceil_div(n, 16)
+
+    unpacked = torch.empty((m, n), dtype=torch.int8, device=packed.device)
+    unpacked[:, 0::2] = packed & 0x0F
+    unpacked[:, 1::2] = (packed >> 4) & 0x0F
+    values = _dequantize_from_fp4_e2m1(unpacked)
+    group_idx = torch.arange(n, device=packed.device) // 16
+    return values * sf[:, group_idx] * global_sf.unsqueeze(1)
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2

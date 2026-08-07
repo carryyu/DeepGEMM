@@ -61,16 +61,27 @@ struct MegaMoEConfig {
 static MmaKind parse_mma_kind(const std::string& mma_type_str) {
     if (mma_type_str == "bf16xbf16")
         return MmaKind::BF16;
-    DG_HOST_ASSERT(mma_type_str == "fp8xfp4");
-    return MmaKind::MXFP8FP4;
+    if (mma_type_str == "fp8xfp4")
+        return MmaKind::MXFP8FP4;
+    DG_HOST_ASSERT(mma_type_str == "nvfp4xnvfp4");
+    return MmaKind::NVFP4NVFP4;
 }
 
-static int get_num_mma_elem_bytes(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::BF16 ? 2 : 1;
+static int get_l1_staging_elem_bytes(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::MXFP8FP4 ? 1 : 2;
 }
 
 static bool is_mma_with_sf(const MmaKind& mma_kind) {
-    return mma_kind == MmaKind::MXFP8FP4;
+    return mma_kind != MmaKind::BF16;
+}
+
+static bool is_mma_with_cross_warp_amax(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::MXFP8FP4 or
+           mma_kind == MmaKind::NVFP4NVFP4;
+}
+
+static int get_sf_gran_k(const MmaKind& mma_kind) {
+    return mma_kind == MmaKind::NVFP4NVFP4 ? 16 : 32;
 }
 
 static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
@@ -100,7 +111,47 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
             return {2, 192, 32, 128, 2};
         }
     }();
-    block_k /= get_num_mma_elem_bytes(mma_kind);
+    if (mma_kind == MmaKind::NVFP4NVFP4) {
+        // Per-token global scaling quantizes the complete post-SwiGLU row
+        // after every L1 N tile has arrived. Cap M so that a rank has
+        // roughly 64--128 row-owner CTA pairs at the quantization frontier
+        // without forcing prefill-size workloads to pay BM16 scheduling
+        // overhead.
+        const auto num_local_routed_tokens =
+            static_cast<int64_t>(num_tokens) * num_topk;
+        const int quant_block_m_cap =
+            num_local_routed_tokens <   512 ?  16 :
+            num_local_routed_tokens <  2048 ?  32 :
+            num_local_routed_tokens <  4096 ?  96 :
+            num_local_routed_tokens < 24576 ? 128 : 192;
+        if (block_m > quant_block_m_cap) {
+            block_m = quant_block_m_cap;
+            if (block_m == 16) {
+                store_block_m = 8;
+                num_epilogue_warpgroups = 2;
+            } else if (block_m == 32) {
+                store_block_m = 16;
+                num_epilogue_warpgroups = 2;
+            } else if (block_m == 64) {
+                store_block_m = 32;
+                num_epilogue_warpgroups = 1;
+            } else if (block_m == 96) {
+                store_block_m = 16;
+                num_epilogue_warpgroups = 2;
+            } else {
+                DG_HOST_ASSERT(block_m == 128);
+                store_block_m = 32;
+                num_epilogue_warpgroups = 2;
+            }
+        }
+        // Packed FP4 makes BK=256 affordable and halves the number of pipeline
+        // turns. The device kernel also accepts BK=128 for future fallbacks.
+        block_k = 256;
+    } else {
+        block_k = block_k * 8 / get_element_bits(mma_kind);
+    }
+    DG_HOST_ASSERT(mma_kind != MmaKind::NVFP4NVFP4 or
+                   block_k == 128 or block_k == 256);
 
     // Check whether our `block_m` lies in `kCandidateBlockM`
     DG_HOST_ASSERT(std::any_of(
@@ -123,7 +174,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     constexpr int kSmemAlignment = 1024;
     constexpr int kNumEpilogueStages = 2;
     constexpr int kNumTMAStoreStages = 2;
-    const int num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
+    const int num_mma_elem_bits = get_element_bits(mma_kind);
 
     // Always multicast on A
     const int load_block_m = block_m / 2;
@@ -138,7 +189,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // C/D output region: max of L1 output staging and L2 BF16 staging.
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m * (block_n / 2) * kNumTMAStoreStages * get_num_mma_elem_bytes(mma_kind);
+    const int smem_cd_l1 = num_epilogue_warpgroups * store_block_m * (block_n / 2) *
+                           kNumTMAStoreStages * get_l1_staging_elem_bytes(mma_kind);
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = align(std::max(smem_cd_l1, smem_cd_l2), kSmemAlignment);
 
@@ -148,11 +200,18 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
 
     // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
     // + schedule task publish full/empty barriers.
-    const int smem_barriers = (num_dispatch_warps + kNumEpilogueStages * 2 + num_epilogue_warps * 2 + kNumScheduleStages * 2) * 8;
+    const int num_nvfp4_pair_barriers =
+        mma_kind == MmaKind::NVFP4NVFP4 ? 3 : 0;
+    const int smem_barriers =
+        (num_dispatch_warps + kNumEpilogueStages * 2 +
+         num_epilogue_warps * 2 + kNumScheduleStages * 2 +
+         num_nvfp4_pair_barriers) * 8;
 
     // Amax warp-pair reduction buffer for SwiGLU's cross-warp amax exchange.
-    const int smem_amax_reduction = is_mma_with_sf(mma_kind) ?
-        store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float)) : 0;
+    const int smem_amax_reduction = is_mma_with_cross_warp_amax(mma_kind) ?
+        align(store_block_m * num_epilogue_warps *
+                  static_cast<int>(sizeof(float)),
+              kSmemAlignment) : 0;
 
     // Tensor memory pointer
     const int smem_tmem_ptr = 4;
@@ -162,8 +221,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
 
     // Per-stage: A tile + B tile + optional SF tiles + full/empty barriers.
-    const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bytes;
-    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bytes;
+    DG_HOST_ASSERT((load_block_m * block_k * num_mma_elem_bits) % 8 == 0);
+    DG_HOST_ASSERT((block_n * block_k * num_mma_elem_bits) % 8 == 0);
+    const int smem_a_size_per_stage = load_block_m * block_k * num_mma_elem_bits / 8;
+    const int smem_b_size_per_stage = block_n * block_k * num_mma_elem_bits / 8;
     DG_HOST_ASSERT(smem_a_size_per_stage % kSmemAlignment == 0);
     DG_HOST_ASSERT(smem_b_size_per_stage % kSmemAlignment == 0);
     const int smem_stage_barriers = 2 * 8;
@@ -190,16 +251,21 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Block config
     const auto [cluster_size, block_m, store_block_m, block_k, num_epilogue_threads] =
-        get_block_config_for_mega_moe(num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_tokens, mma_kind);
+        get_block_config_for_mega_moe(
+            num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+            num_tokens, mma_kind);
     const int block_n = 128;
     const int load_block_m = block_m / 2;
     const int load_block_n = block_n;
     const auto [sf_block_m, sf_block_n] = is_mma_with_sf(mma_kind) ?
-        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, MmaKind::MXFP8FP4) : std::pair(0, 0);
-    // NOTES: FP8 activations and FP4 weights (unpacked to 8-bit in smem) both use 128B swizzle
-    const int swizzle_acts_mode = 128;
-    const int swizzle_weights_mode = 128;
-    const int gran_k = 32;
+        SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(block_m, block_n, mma_kind) : std::pair(0, 0);
+    // MXFP8/FP4 unpacks to byte elements in SMEM. NVFP4 remains packed, so a
+    // full K-major swizzle atom occupies BLOCK_K / 2 physical bytes.
+    const int swizzle_acts_mode =
+        mma_kind == MmaKind::NVFP4NVFP4 ? block_k / 2 : 128;
+    const int swizzle_weights_mode =
+        mma_kind == MmaKind::NVFP4NVFP4 ? block_k / 2 : 128;
+    const int gran_k = get_sf_gran_k(mma_kind);
 
     // Thread layout
     const int num_dispatch_threads = 128;
@@ -207,7 +273,8 @@ static MegaMoEConfig get_mega_moe_config(
 
     // Pull: divide token bytes by 2 until <= kPullThreshold
     constexpr int kPullThreshold = 4096;
-    int num_bytes_per_pull = hidden * get_num_mma_elem_bytes(mma_kind);
+    DG_HOST_ASSERT((hidden * get_element_bits(mma_kind)) % 8 == 0);
+    int num_bytes_per_pull = hidden * get_element_bits(mma_kind) / 8;
     while (num_bytes_per_pull > kPullThreshold) {
         DG_HOST_ASSERT(num_bytes_per_pull % 2 == 0);
         num_bytes_per_pull /= 2;
@@ -236,8 +303,9 @@ static MegaMoEConfig get_mega_moe_config(
     // Print configs for the first time
     if (get_env<int>("DG_JIT_DEBUG") or get_env<int>("DG_PRINT_CONFIGS")) {
         const auto key = fmt::format(
-            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={})",
-            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank, num_tokens, num_topk);
+            "MegaMoEConfig(num_ranks={}, num_experts={}, hidden={}, intermediate_hidden={}, num_max_tokens_per_rank={}, num_tokens={}, num_topk={}, mma_kind={})",
+            num_ranks, num_experts, hidden, intermediate_hidden, num_max_tokens_per_rank,
+            num_tokens, num_topk, static_cast<int>(mma_kind));
         static std::unordered_set<std::string> printed;
         if (printed.count(key) == 0) {
             std::cout << key << ": " << config << std::endl;
